@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyo
 
 # Environments
 .env
@@ -15,3 +16,8 @@ ENV/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/

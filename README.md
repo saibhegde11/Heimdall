@@ -9,7 +9,7 @@
 
 > *"Heimdall stands watch at the gates of the Bifröst, observing all that enters and guiding traffic safely across the realms."*
 
-**Heimdall** is a lightweight, asynchronous reverse proxy and load balancer built with **FastAPI** and **HTTPX**. It intercepts incoming HTTP traffic and distributes requests across a pool of backend servers using the **Round-Robin** scheduling algorithm.
+**Heimdall** is a lightweight, asynchronous reverse proxy and load balancer built with **FastAPI** and **HTTPX**. It distributes incoming HTTP traffic across a pool of backend servers with support for multiple load balancing algorithms, active health checks, automatic failover, and per-IP rate limiting — all configured via a single YAML file.
 
 ---
 
@@ -17,23 +17,46 @@
 
 ```mermaid
 flowchart LR
-    Client([🌐 Client Request]) --> Heimdall[🛡️ Heimdall Proxy\n:8000]
-    
-    subgraph Backend Cluster
-        Heimdall -- Request 1 --> S1[🖥️ Backend 1\n:8001]
-        Heimdall -- Request 2 --> S2[🖥️ Backend 2\n:8002]
-        Heimdall -- Request 3 --> S3[🖥️ Backend 3\n:8003]
+    Client([🌐 Client]) --> Proxy
+
+    subgraph Heimdall["🛡️ Heimdall Proxy :8000"]
+        direction TB
+        RL[Rate Limiter] --> LB[Load Balancer]
+        LB --> Retry[Retry Logic]
+        HC[Health Checker] -.->|updates| LB
     end
+
+    Proxy --> RL
+
+    subgraph Backends["Backend Cluster"]
+        S1[🖥️ Backend 1\n:8001 w=3]
+        S2[🖥️ Backend 2\n:8002 w=2]
+        S3[🖥️ Backend 3\n:8003 w=1]
+    end
+
+    Retry --> S1
+    Retry --> S2
+    Retry --> S3
+    HC -.-> S1
+    HC -.-> S2
+    HC -.-> S3
 ```
 
 ---
 
 ## ✨ Features
 
-- 🔄 **Round-Robin Load Balancing**: Even distribution of incoming requests across backend nodes.
-- ⚡ **Fully Asynchronous**: Powered by FastAPI and `httpx.AsyncClient` for high throughput and non-blocking I/O.
-- 🎯 **Transparent Proxying**: Forwards requests and seamlessly relays JSON responses back to clients.
-- 🪶 **Zero-bloat & Minimalist**: Clean, understandable codebase ideal for learning or extending custom routing policies.
+- 🔄 **Multiple Load Balancing Algorithms**
+  - **Round-Robin**: Even, sequential distribution across backends.
+  - **Weighted Round-Robin**: Proportional traffic distribution using the Smooth Weighted Round-Robin (SWRR) algorithm — avoids bursty routing.
+  - **Least Connections**: Routes to the backend with the fewest in-flight requests — ideal for uneven processing times.
+- 🩺 **Active Health Checks**: Background task pings each backend periodically. Unhealthy nodes are automatically ejected and restored on recovery.
+- 🔁 **Automatic Retry**: If a backend fails mid-request, Heimdall retries on the next healthy backend (up to 3 attempts).
+- 🎯 **Transparent Reverse Proxying**: Forwards **all HTTP methods** (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS), preserving paths, query strings, headers, and request bodies.
+- 🚦 **Per-IP Rate Limiting**: Sliding-window rate limiter prevents abuse, returning `429 Too Many Requests` with `Retry-After` headers.
+- 📊 **Admin Endpoints**: Real-time visibility into backend health and per-backend request statistics.
+- ⚙️ **YAML Configuration**: No hardcoded server lists — configure backends, algorithms, health checks, and rate limits in `config.yaml`.
+- 📝 **Structured Logging**: Every proxied request is logged with method, path, target backend, status code, and latency.
 
 ---
 
@@ -41,10 +64,17 @@ flowchart LR
 
 ```text
 loadBalancer/
-├── proxy.py          # Heimdall reverse proxy and load balancer logic
-├── server.py         # Mock backend server application
-├── .gitignore        # Git ignore configurations
-└── README.md         # Documentation
+├── config.yaml               # Backends, algorithm, health check & rate limit settings
+├── proxy.py                   # Heimdall reverse proxy — the main entry point
+├── server.py                  # Enhanced mock backend server for testing
+├── requirements.txt           # Python dependencies
+├── balancer/
+│   ├── __init__.py
+│   ├── algorithms.py          # Round-Robin, Weighted Round-Robin, Least Connections
+│   ├── health.py              # Background health checker with auto-ejection
+│   └── rate_limiter.py        # Per-IP sliding window rate limiter
+├── .gitignore
+└── README.md
 ```
 
 ---
@@ -53,17 +83,43 @@ loadBalancer/
 
 ### 1. Prerequisites
 
-Ensure you have Python 3.9+ installed. Install the required dependencies:
+Python 3.9+ is required. Install dependencies:
 
 ```bash
-pip install fastapi uvicorn httpx
+pip install -r requirements.txt
 ```
 
----
+### 2. Configure
 
-### 2. Launch Backend Servers
+Edit `config.yaml` to define your backend pool and preferences:
 
-Start multiple backend instances on different ports (e.g. `8001`, `8002`, `8003`):
+```yaml
+backends:
+  - url: "http://127.0.0.1:8001"
+    weight: 3
+  - url: "http://127.0.0.1:8002"
+    weight: 2
+  - url: "http://127.0.0.1:8003"
+    weight: 1
+
+algorithm: "round-robin"  # round-robin | weighted-round-robin | least-connections
+
+health_check:
+  enabled: true
+  interval_seconds: 10
+  timeout_seconds: 3
+  unhealthy_threshold: 3
+  endpoint: "/health"
+
+rate_limit:
+  enabled: true
+  max_requests: 50
+  window_seconds: 60
+```
+
+### 3. Launch Backend Servers
+
+Start multiple backend instances on different ports:
 
 ```bash
 # Terminal 1
@@ -76,11 +132,7 @@ uvicorn server:app --port 8002
 uvicorn server:app --port 8003
 ```
 
----
-
-### 3. Launch Heimdall Proxy
-
-In another terminal, start the Heimdall load balancer on port `8000`:
+### 4. Launch Heimdall
 
 ```bash
 uvicorn proxy:app --port 8000
@@ -88,48 +140,107 @@ uvicorn proxy:app --port 8000
 
 ---
 
-## 🧪 Testing the Load Balancer
+## 🧪 Usage Examples
 
-Send successive requests to Heimdall on port `8000`:
+### Basic Load Balancing (Round-Robin)
 
 ```bash
+# Successive requests are distributed across backends
+curl http://127.0.0.1:8000/
+curl http://127.0.0.1:8000/
 curl http://127.0.0.1:8000/
 ```
 
-### Sample Output Sequence:
+```json
+{"message":"Success","handled_by":"Server running on port 8001","timestamp":1723456789.0}
+{"message":"Success","handled_by":"Server running on port 8002","timestamp":1723456790.0}
+{"message":"Success","handled_by":"Server running on port 8003","timestamp":1723456791.0}
+```
 
-**Request 1:**
+### POST Body Proxying
+
+```bash
+curl -X POST http://127.0.0.1:8000/echo \
+  -H "Content-Type: application/json" \
+  -d '{"key": "value"}'
+```
+
 ```json
 {
-  "message": "Success",
-  "handled_by": "Server running on port 8001"
+  "handled_by": "Server running on port 8001",
+  "echoed_body": {"key": "value"},
+  "content_type": "application/json"
 }
 ```
 
-**Request 2:**
+### Path Parameter Proxying
+
+```bash
+curl http://127.0.0.1:8000/items/1
+```
+
 ```json
 {
-  "message": "Success",
-  "handled_by": "Server running on port 8002"
+  "handled_by": "Server running on port 8002",
+  "item_id": 1,
+  "name": "Mjölnir",
+  "type": "weapon"
 }
 ```
 
-**Request 3:**
+### Admin — Backend Health
+
+```bash
+curl http://127.0.0.1:8000/_heimdall/health
+```
+
 ```json
 {
-  "message": "Success",
-  "handled_by": "Server running on port 8003"
+  "algorithm": "round-robin",
+  "backends": [
+    {"url": "http://127.0.0.1:8001", "weight": 3, "healthy": true, "consecutive_failures": 0},
+    {"url": "http://127.0.0.1:8002", "weight": 2, "healthy": true, "consecutive_failures": 0},
+    {"url": "http://127.0.0.1:8003", "weight": 1, "healthy": false, "consecutive_failures": 3}
+  ]
+}
+```
+
+### Admin — Request Statistics
+
+```bash
+curl http://127.0.0.1:8000/_heimdall/stats
+```
+
+```json
+{
+  "stats": [
+    {"url": "http://127.0.0.1:8001", "total_requests": 42, "total_failures": 0, "avg_latency_ms": 12.5},
+    {"url": "http://127.0.0.1:8002", "total_requests": 38, "total_failures": 1, "avg_latency_ms": 15.3},
+    {"url": "http://127.0.0.1:8003", "total_requests": 20, "total_failures": 3, "avg_latency_ms": 8.7}
+  ]
 }
 ```
 
 ---
 
+## ⚙️ Load Balancing Algorithms
+
+| Algorithm | Best For | How It Works |
+|---|---|---|
+| `round-robin` | Equal-capacity backends | Cycles through backends sequentially |
+| `weighted-round-robin` | Mixed-capacity backends | Uses SWRR to distribute traffic proportionally by weight without bursts |
+| `least-connections` | Variable processing times | Routes to the backend with the fewest active in-flight requests |
+
+Switch algorithms by changing the `algorithm` field in `config.yaml` — no code changes needed.
+
+---
+
 ## 🔮 Roadmap
 
-- [ ] 🩺 **Active Health Checks**: Automatic detection and ejection of unhealthy backend nodes.
-- [ ] ⚖️ **Weighted Round-Robin & Least Connections**: Advanced traffic scheduling algorithms.
 - [ ] 🔒 **TLS / SSL Termination**: Secure ingress traffic handling.
-- [ ] 📊 **Metrics & Monitoring Dashboard**: Real-time stats for throughput, latency, and node health.
+- [ ] 📊 **Monitoring Dashboard**: Web UI for real-time throughput, latency, and node health visualization.
+- [ ] 🌐 **WebSocket Proxying**: Support for persistent WebSocket connections.
+- [ ] 🐳 **Docker Compose Setup**: One-command deployment of the full stack.
 
 ---
 
