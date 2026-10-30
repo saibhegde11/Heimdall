@@ -1,23 +1,15 @@
-# Python bytecode and cache
 __pycache__/
 *.py[cod]
-*$py.class
-*.pyo
-
-# Environments
-.env
-.venv
-env/
+.pytest_cache/
+.venv/
 venv/
-ENV/
+.coverage
+htmlcov/
+.env
+*.log
+benchmark_results/*
+!benchmark_results/reference_linux/
+!benchmark_results/reference_linux/**
 
-# IDE & OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
+Heimdall_Interview_Story.*
+Heimdall_Complete_Study_Notes.*

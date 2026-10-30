@@ -1,0 +1,19 @@
+{
+  "backends": [
+    {
+      "url": "http://127.0.0.1:8001",
+      "weight": 2
+    },
+    {
+      "url": "http://127.0.0.1:8002",
+      "weight": 1
+    }
+  ],
+  "balancing_algorithm": "least_in_flight",
+  "backend_timeout": 2.0,
+  "health_check_timeout": 1.0,
+  "health_check_interval": 2.0,
+  "forwarding_timeout": 3.0,
+  "rate_limit_capacity": 10,
+  "rate_limit_refill_rate": 2.0
+}

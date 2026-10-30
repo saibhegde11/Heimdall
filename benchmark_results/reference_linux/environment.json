@@ -1,0 +1,63 @@
+{
+  "started_utc": "2026-10-30T14:33:38.875745+00:00",
+  "python": "3.12.14",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "logical_cpus": 9,
+  "versions": {
+    "fastapi": "0.161.1",
+    "httpx": "0.28.1",
+    "pydantic": "2.14.1",
+    "uvicorn": "0.54.0",
+    "starlette": "1.9.0",
+    "anyio": "4.15.1",
+    "h11": "0.16.0"
+  },
+  "protocol": "HTTP/1.1 over IPv4 loopback TCP",
+  "uvicorn": {
+    "workers_per_process": 1,
+    "loop": "asyncio",
+    "http": "h11",
+    "log_level": "error",
+    "access_log": false
+  },
+  "load_model": "closed loop; zero think time; drain started requests",
+  "network_environment": "load generator and proxy upstream clients use trust_env=False",
+  "source_sha256": {
+    "proxy.py": "c858b7c5d0c8fbcbb10ce9707c0f287b161f3cea3410a594c65ec51162dbe7b5",
+    "balancer.py": "e167f000af047844f2f74ada756420dda165fdb24118fb27510907b0fb1d5868",
+    "health_checks.py": "699196e3c65c3bdc40ec49bb513ddfa33ecf45a51771a9bd6a6af58682de7421",
+    "rate_limiter.py": "5f9da323db494bc1bcbc0bb6fcbf5251021b64c514827033d0eda5b30d569d88",
+    "metrics.py": "cf30649bad39e63ee08cdc750257a1aafa8647ff165595656f0669f7abdcd64f",
+    "config.py": "91f0b95bdbb2e1c8957a4a35748a72809856774db715793dc4fab6b517166c7d",
+    "config.json": "d03ff5888ff9dc992f526022f5756005b1e1ba27678c45136bf23df3fa3524b2",
+    "requirements.txt": "f5649af5b0fa28a7c46421cdffc029ef5241b89d16eca46b4023377f48d85786",
+    "benchmarks/backend.py": "ce37ab49395cb2eab0d58d061cbeee5539de7954bd124bf0c90bb691f977b979",
+    "benchmarks/load.py": "5f09b606dd42bbea07ace341d4f0a93c787fcbc7081ecc863102b62429fa233c",
+    "benchmarks/run_benchmark.py": "dc72447eee71f06f871b468a06d82ee0a4c8d7ecb15f9233af0c0a10655ef81c"
+  },
+  "affinity_cpus": 9,
+  "cpu_quota": "800000 100000",
+  "memory_limit": "8589934592",
+  "arguments": {
+    "duration": 3.0,
+    "warmup": 0.5,
+    "concurrency": [
+      1,
+      8,
+      32
+    ],
+    "repetitions": 3,
+    "profiles": [
+      "equal",
+      "unequal"
+    ],
+    "modes": [
+      "direct_a",
+      "round_robin",
+      "weighted_round_robin",
+      "least_in_flight"
+    ],
+    "slots": 4,
+    "output": "/workspace/scratch/88901b5504b0/heimdall_benchmark/Heimdall/benchmark_results/reference_linux"
+  }
+}

@@ -1,312 +1,267 @@
-"""
-Heimdall — Async HTTP Load Balancer & Reverse Proxy
-
-A transparent reverse proxy that distributes incoming HTTP traffic across
-a pool of backend servers. Supports multiple load balancing algorithms,
-active health checks, per-IP rate limiting, and request retries.
-
-Usage:
-    uvicorn proxy:app --port 8000
-"""
-
-import logging
-import time
-from contextlib import asynccontextmanager
-from pathlib import Path
-
-import httpx
-import yaml
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
-
-from balancer.algorithms import create_balancer, LoadBalancer
-from balancer.health import HealthChecker
-from balancer.rate_limiter import RateLimiter
-
-# ── Logging Setup ────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s │ %(name)-22s │ %(levelname)-7s │ %(message)s",
-    datefmt="%H:%M:%S",
+from fastapi import FastAPI, HTTPException, Response, Request
+from fastapi.responses import JSONResponse
+import balancer
+from balancer import (
+    BACKENDS,
+    choose_untried_backend,
+    finish_backend_request,
+    get_in_flight,
 )
-logger = logging.getLogger("heimdall.proxy")
+import httpx
+import asyncio
+import json
+import logging
+import math
+import time
+import uuid
+from contextlib import asynccontextmanager
+from health_checks import get_healthy_backends
+from rate_limiter import allow_request
+from config import get_settings
+from metrics import get_totals, increment_counter
 
-# ── Configuration ────────────────────────────────────────────
-
-CONFIG_PATH = Path(__file__).parent / "config.yaml"
-
-
-def load_config() -> dict:
-    """Load and return the YAML configuration file."""
-    with open(CONFIG_PATH, "r") as f:
-        config = yaml.safe_load(f)
-    logger.info("Configuration loaded from %s", CONFIG_PATH)
-    return config
-
-
-# ── Globals (initialized during lifespan) ────────────────────
-
-config: dict = {}
-balancer: LoadBalancer | None = None
-health_checker: HealthChecker | None = None
-rate_limiter: RateLimiter | None = None
-http_client: httpx.AsyncClient | None = None
-
-# Per-backend stats tracking
-stats: dict[str, dict] = {}
-
-# Headers that should NOT be forwarded between client ↔ proxy ↔ backend
-# (hop-by-hop headers per HTTP/1.1 spec, RFC 2616 §13.5.1)
-HOP_BY_HOP_HEADERS = frozenset({
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade",
-    "host",  # We also strip Host since the backend has a different host
-})
-
-# Maximum number of backends to retry on failure
-MAX_RETRIES = 3
+settings = get_settings()
+BACKEND_TIMEOUT = settings.backend_timeout
+HEALTH_CHECK_TIMEOUT = settings.health_check_timeout
+HEALTH_CHECK_INTERVAL = settings.health_check_interval
+FORWARDING_TIMEOUT = settings.forwarding_timeout
+logger = logging.getLogger("uvicorn.error.heimdall")
 
 
-# ── Application Lifespan ─────────────────────────────────────
+def log_event(level: int, event: str, **fields) -> None:
+    if logger.isEnabledFor(level):
+        logger.log(level, json.dumps({"event": event, **fields}))
+
+
+async def monitor_backends(
+    app : FastAPI,
+    health_client : httpx.AsyncClient,
+) : 
+    while True : 
+        await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
+        healthy_backends = await get_healthy_backends(
+            health_client,
+            BACKENDS,
+        )
+
+        if healthy_backends != app.state.healthy_backends : 
+            app.state.healthy_backends = healthy_backends
+            log_event(
+                logging.INFO,
+                "health_snapshot_changed",
+                healthy_backends=healthy_backends,
+            )
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup and shutdown logic for the FastAPI application."""
-    global config, balancer, health_checker, rate_limiter, http_client, stats
-
-    # ─ Startup ─
-    config = load_config()
-
-    # Initialize backends
-    backends = config.get("backends", [])
-    for b in backends:
-        b.setdefault("weight", 1)
-        stats[b["url"]] = {
-            "requests": 0,
-            "failures": 0,
-            "total_latency_ms": 0.0,
-        }
-
-    # Initialize load balancer
-    algorithm_name = config.get("algorithm", "round-robin")
-    balancer = create_balancer(algorithm_name)
-    logger.info(
-        "Load balancer initialized: algorithm=%s, backends=%d",
-        algorithm_name, len(backends),
-    )
-
-    # Initialize health checker
-    hc_config = config.get("health_check", {})
-    health_checker = HealthChecker(
-        backends=backends,
-        interval=hc_config.get("interval_seconds", 10),
-        timeout=hc_config.get("timeout_seconds", 3),
-        unhealthy_threshold=hc_config.get("unhealthy_threshold", 3),
-        endpoint=hc_config.get("endpoint", "/health"),
-    )
-    if hc_config.get("enabled", True):
-        health_checker.start()
-
-    # Initialize rate limiter
-    rl_config = config.get("rate_limit", {})
-    rate_limiter = RateLimiter(
-        max_requests=rl_config.get("max_requests", 50),
-        window_seconds=rl_config.get("window_seconds", 60),
-    )
-    if rl_config.get("enabled", True):
-        rate_limiter.start()
-
-    # Initialize shared HTTP client (connection pooling)
-    http_client = httpx.AsyncClient(timeout=30.0)
-
-    logger.info("🛡️  Heimdall is ready. Guarding the Bifröst.")
-
-    yield  # ← App is running
-
-    # ─ Shutdown ─
-    if health_checker:
-        await health_checker.stop()
-    if rate_limiter:
-        await rate_limiter.stop()
-    if http_client:
-        await http_client.aclose()
-
-    logger.info("🛡️  Heimdall has shut down.")
-
-
-# ── FastAPI App ──────────────────────────────────────────────
-
-app = FastAPI(
-    title="Heimdall Load Balancer",
-    description="Async HTTP reverse proxy and load balancer",
-    lifespan=lifespan,
-)
-
-
-# ── Admin Endpoints ──────────────────────────────────────────
-# Prefixed with /_heimdall/ to avoid collisions with proxied routes.
-
-@app.get("/_heimdall/health")
-async def admin_health():
-    """Show the health status of all registered backends."""
-    return {
-        "algorithm": config.get("algorithm", "round-robin"),
-        "backends": health_checker.get_all_statuses() if health_checker else [],
-    }
-
-
-@app.get("/_heimdall/stats")
-async def admin_stats():
-    """Show per-backend request statistics."""
-    enriched_stats = []
-    for url, s in stats.items():
-        avg_latency = (
-            round(s["total_latency_ms"] / s["requests"], 2)
-            if s["requests"] > 0
-            else 0.0
+async def lifespan(app : FastAPI) : 
+    async with (
+        httpx.AsyncClient(timeout=BACKEND_TIMEOUT, trust_env=False) as client,
+        httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT, trust_env=False) as health_client,
+    ):
+        app.state.http_client = client
+        app.state.healthy_backends = await get_healthy_backends(
+            health_client, 
+            BACKENDS,
         )
-        enriched_stats.append({
-            "url": url,
-            "total_requests": s["requests"],
-            "total_failures": s["failures"],
-            "avg_latency_ms": avg_latency,
-        })
-    return {"stats": enriched_stats}
+        log_event(
+            logging.INFO,
+            "health_snapshot_initialized",
+            healthy_backends=app.state.healthy_backends,
+        )
+        health_task = asyncio.create_task(
+            monitor_backends(app, health_client)
+        )
+        try : 
+            yield
+        finally : 
+            health_task.cancel()
 
+            try : 
+                await health_task
+            except asyncio.CancelledError : 
+                pass
 
-# ── Catch-All Proxy Route ───────────────────────────────────
+app = FastAPI(lifespan = lifespan)
 
-@app.api_route(
-    "/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-)
-async def proxy_request(request: Request, path: str):
-    """
-    Transparent reverse proxy handler.
-
-    Forwards any incoming request to a healthy backend, preserving:
-      - HTTP method
-      - URL path and query string
-      - Request headers (minus hop-by-hop headers)
-      - Request body
-
-    Returns the backend's response (status, headers, body) to the client.
-    """
-    # ── Rate Limiting ──
-    rl_config = config.get("rate_limit", {})
-    if rl_config.get("enabled", True) and rate_limiter:
-        client_ip = request.client.host if request.client else "unknown"
-        allowed, info = await rate_limiter.is_allowed(client_ip)
-
-        if not allowed:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "error": "Too Many Requests",
-                    "retry_after": info["retry_after"],
-                },
-                headers={"Retry-After": str(info["retry_after"])},
-            )
-
-    # ── Select Backend with Retry ──
-    healthy = health_checker.get_healthy_backends() if health_checker else config.get("backends", [])
-
-    if not healthy:
-        logger.error("No healthy backends available!")
-        return JSONResponse(
-            status_code=503,
-            content={"error": "Service Unavailable", "detail": "No healthy backends"},
+async def fetch_from_backend(path: str, request: Request):
+    increment_counter("requests_total")
+    request_id = uuid.uuid4().hex
+    client_ip = request.client.host if request.client is not None else "unknown"
+    allowed, retry_after = allow_request(client_ip)
+    if not allowed:
+        increment_counter("rate_limited_total")
+        retry_seconds = max(1, math.ceil(retry_after))
+        log_event(
+            logging.INFO,
+            "rate_limited",
+            request_id=request_id,
+            method=request.method,
+            status_code=429,
+            retry_after_seconds=retry_seconds,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too Many Requests",
+            headers={
+                "Retry-After": str(retry_seconds),
+                "Cache-Control": "no-store",
+            },
         )
 
-    # Build the outgoing request components
     body = await request.body()
-    headers = _filter_headers(request.headers)
-    query_string = str(request.url.query) if request.url.query else ""
+    client = app.state.http_client
 
-    # Try up to MAX_RETRIES different backends
-    tried_urls: set[str] = set()
-    last_error: str = ""
+    headers = {}
+    content_type = request.headers.get("content-type")
+    if content_type is not None:
+        headers["content-type"] = content_type
 
-    for attempt in range(min(MAX_RETRIES, len(healthy))):
-        # Get next backend from the algorithm
-        available = [b for b in healthy if b["url"] not in tried_urls]
-        if not available:
-            break
+    attempted = set()
+    last_error = None
+    max_attempts = 2 if request.method == "GET" else 1
 
-        backend = await balancer.get_next_backend(available)
-        if backend is None:
-            break
+    try:
+        async with asyncio.timeout(FORWARDING_TIMEOUT):
+            for attempt_number in range(1, max_attempts + 1):
+                url = choose_untried_backend(
+                    app.state.healthy_backends,
+                    attempted,
+                )
 
-        backend_url = backend["url"]
-        tried_urls.add(backend_url)
+                if url is None:
+                    break
 
-        # Build target URL
-        target = f"{backend_url}/{path}"
-        if query_string:
-            target = f"{target}?{query_string}"
+                attempted.add(url)
+                started = time.perf_counter()
+                attempt_fields = {
+                    "request_id": request_id,
+                    "method": request.method,
+                    "backend": url,
+                    "attempt": attempt_number,
+                }
 
-        # Track connection for least-connections
-        balancer.record_connection_start(backend_url)
-        start_time = time.time()
+                try:
+                    increment_counter("backend_attempts_total")
+                    if attempt_number > 1:
+                        increment_counter("retries_total")
+                    response = await client.request(
+                        method=request.method,
+                        url=f"{url}{path}",
+                        params=request.query_params.multi_items(),
+                        content=body,
+                        headers=headers,
+                        follow_redirects=False,
+                    )
+                except httpx.RequestError as error:
+                    last_error = error
+                    log_event(
+                        logging.WARNING,
+                        "backend_request_failed",
+                        **attempt_fields,
+                        error_type=type(error).__name__,
+                        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                    )
+                    continue
+                except asyncio.CancelledError:
+                    log_event(
+                        logging.INFO,
+                        "backend_attempt_cancelled",
+                        **attempt_fields,
+                        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                    )
+                    raise
+                except Exception as error:
+                    log_event(
+                        logging.ERROR,
+                        "backend_unexpected_error",
+                        **attempt_fields,
+                        error_type=type(error).__name__,
+                        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                    )
+                    raise
+                finally:
+                    finish_backend_request(url)
 
-        try:
-            response = await http_client.request(
-                method=request.method,
-                url=target,
-                headers=headers,
-                content=body,
-            )
+                log_event(
+                    logging.INFO,
+                    "backend_response",
+                    **attempt_fields,
+                    status_code=response.status_code,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                )
+                response_headers = {}
+                location = response.headers.get("location")
+                if location is not None:
+                    response_headers["location"] = location
 
-            # Record stats
-            latency_ms = (time.time() - start_time) * 1000
-            stats[backend_url]["requests"] += 1
-            stats[backend_url]["total_latency_ms"] += latency_ms
-            balancer.record_connection_end(backend_url)
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    headers=response_headers,
+                    media_type=response.headers.get("content-type"),
+                )
+    except TimeoutError:
+        log_event(
+            logging.WARNING,
+            "forwarding_deadline_exceeded",
+            request_id=request_id,
+            method=request.method,
+            status_code=504,
+            timeout_seconds=FORWARDING_TIMEOUT,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail="Backend Request Timed Out",
+        )
 
-            logger.info(
-                "%s %s → %s [%d] %.0fms",
-                request.method, f"/{path}", backend_url,
-                response.status_code, latency_ms,
-            )
+    if last_error is None:
+        log_event(
+            logging.WARNING,
+            "forwarding_unavailable",
+            request_id=request_id,
+            method=request.method,
+            status_code=503,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="No healthy backends available",
+        )
 
-            # Build and return the proxied response
-            response_headers = _filter_headers(response.headers)
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=dict(response_headers),
-            )
-
-        except httpx.RequestError as exc:
-            balancer.record_connection_end(backend_url)
-            stats[backend_url]["failures"] += 1
-            last_error = str(exc)
-            logger.warning(
-                "%s %s → %s FAILED (attempt %d/%d): %s",
-                request.method, f"/{path}", backend_url,
-                attempt + 1, MAX_RETRIES, last_error,
-            )
-            continue
-
-    # All retries exhausted
-    logger.error("All backend attempts failed for %s /%s", request.method, path)
-    return JSONResponse(
-        status_code=502,
-        content={
-            "error": "Bad Gateway",
-            "detail": f"All backends failed. Last error: {last_error}",
-        },
+    status_code = 504 if isinstance(last_error, httpx.TimeoutException) else 502
+    detail = "Backend Request Timed Out" if status_code == 504 else "Backend Request Failed"
+    log_event(
+        logging.WARNING,
+        "forwarding_failed",
+        request_id=request_id,
+        method=request.method,
+        status_code=status_code,
+        error_type=type(last_error).__name__,
+    )
+    raise HTTPException(
+        status_code=status_code,
+        detail=detail,
     )
 
 
-def _filter_headers(headers) -> dict[str, str]:
-    """
-    Filter out hop-by-hop headers that should not be forwarded
-    between proxy and backend/client.
-    """
-    return {
-        key: value
-        for key, value in headers.items()
-        if key.lower() not in HOP_BY_HOP_HEADERS
-    }
+@app.get("/stats")
+async def get_stats():
+    in_flight = get_in_flight()
+    return JSONResponse(
+        content={
+            **get_totals(),
+            "balancing_algorithm": balancer.BALANCING_ALGORITHM,
+            "configured_backends": list(BACKENDS),
+            "healthy_backends": list(app.state.healthy_backends),
+            "in_flight": {
+                backend: in_flight.get(backend, 0)
+                for backend in BACKENDS
+            },
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST"])
+async def proxy_request(path : str, request : Request) :
+    return await fetch_from_backend(f"/{path}", request)
